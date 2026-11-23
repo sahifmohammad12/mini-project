@@ -1,11 +1,12 @@
 /**
  * App.jsx — Blockchain-Based Deepfake Verification System
  *
- * Core Concept:
- *   - Column 1: "Register File" — Company credentials required (ID & Password) to mint records to the blockchain.
- *   - Column 2: "Upload & Verify File" — Public access for everyone else to verify any media against the blockchain.
- *   - End-to-End SHA-256: Hashes are calculated in the browser (Web Crypto API) and independently
- *     on the server (Node crypto), cross-checked in the UI to guarantee cryptographic integrity.
+ * Decentralized Architecture:
+ *   - SHA-256: Dual client-side & server-side cryptographic media fingerprinting
+ *   - IPFS (InterPlanetary File System): Standard CIDv0 (Qm...) decentralized content-addressed storage
+ *   - MetaMask Web3 Wallet: EIP-191 cryptographic signatures for media provenance & ownership attestation
+ *   - Immutable Ledger: Proof-of-Work blockchain consensus with live explorer
+ *   - Dual-Channel Access: Company Portal (ID/Password + Web3 Signature) vs Public Verification (Everyone)
  */
 
 import { lazy, Suspense, useEffect, useState, useRef, useCallback } from "react";
@@ -13,11 +14,6 @@ import { lazy, Suspense, useEffect, useState, useRef, useCallback } from "react"
 const HashField = lazy(() => import("./HashField.jsx"));
 
 // ─── Resilient API Client & Live Deployment Config ────────────────────────────
-// Priority for API Base URL:
-//   1. User-customized URL in localStorage (can be set directly in the UI when deployed live)
-//   2. Vite environment variable: import.meta.env.VITE_API_URL (set in Vercel/Netlify/Render)
-//   3. Default relative path: "/api" (works automatically when full-stack is deployed on Render/Railway/VPS)
-//   4. Local fallback: "http://localhost:4000/api" (ONLY on localhost/127.0.0.1)
 
 const isLocalhost =
   typeof window !== "undefined" &&
@@ -55,11 +51,9 @@ async function requestApi(endpoint, options = {}) {
   const path = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
 
   const buildUrl = (base) => {
-    // If base already ends with /api and path starts with /api, avoid /api/api
     if (base.endsWith("/api") && path.startsWith("/api")) {
       return `${base}${path.slice(4)}`;
     }
-    // If base doesn't end with /api and path starts with /api
     return `${base}${path}`;
   };
 
@@ -68,13 +62,11 @@ async function requestApi(endpoint, options = {}) {
     res = await fetch(buildUrl(activeApiBase), options);
     const ct = res.headers.get("content-type") || "";
 
-    // If local dev server returned index.html (SPA fallback because Vite proxy wasn't loaded)
     if (isLocalhost && ct.includes("text/html") && activeApiBase === "/api") {
       activeApiBase = "http://localhost:4000/api";
       res = await fetch(buildUrl(activeApiBase), options);
     }
   } catch (err) {
-    // If local relative /api failed due to network / connection refusal
     if (isLocalhost && activeApiBase === "/api") {
       activeApiBase = "http://localhost:4000/api";
       res = await fetch(buildUrl(activeApiBase), options);
@@ -132,8 +124,29 @@ const tagCls =
 const ORIGINAL = "This photo is original.";
 const HEX = "0123456789abcdef";
 
-// ─── SHA-256 Helpers ──────────────────────────────────────────────────────────
-// Uses the native Web Crypto API (SHA-256) inside the browser.
+// ─── Cryptographic & IPFS Helpers ─────────────────────────────────────────────
+
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+function base58Encode(bytes) {
+  const digits = [0];
+  for (let i = 0; i < bytes.length; i++) {
+    for (let j = 0; j < digits.length; j++) digits[j] <<= 8;
+    digits[0] += bytes[i];
+    let carry = 0;
+    for (let j = 0; j < digits.length; ++j) {
+      digits[j] += carry;
+      carry = (digits[j] / 58) | 0;
+      digits[j] %= 58;
+    }
+    while (carry) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
+  }
+  for (let i = 0; bytes[i] === 0 && i < bytes.length - 1; i++) digits.push(0);
+  return digits.reverse().map((d) => BASE58_ALPHABET[d]).join("");
+}
 
 async function sha256Text(text) {
   if (!window.crypto?.subtle) return "";
@@ -145,6 +158,192 @@ async function sha256File(file) {
   const buf = await file.arrayBuffer();
   const hash = await crypto.subtle.digest("SHA-256", buf);
   return Array.from(new Uint8Array(hash), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Computes standard canonical IPFS CIDv0 (Base58btc multihash Qm...) in browser
+ */
+async function calculateClientIpfsCid(file) {
+  const buf = await file.arrayBuffer();
+  const hashBuffer = await crypto.subtle.digest("SHA-256", buf);
+  const hashBytes = new Uint8Array(hashBuffer);
+  const multihash = new Uint8Array(2 + hashBytes.length);
+  multihash[0] = 0x12; // sha2-256
+  multihash[1] = 0x20; // 32 bytes
+  multihash.set(hashBytes, 2);
+  return base58Encode(multihash);
+}
+
+function formatAddress(addr) {
+  if (!addr) return "";
+  return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+}
+
+// ─── MetaMask Web3 Wallet Hook ────────────────────────────────────────────────
+
+function useMetaMask() {
+  const [account, setAccount] = useState(null);
+  const [chainId, setChainId] = useState(null);
+  const [networkName, setNetworkName] = useState("");
+  const [balance, setBalance] = useState(null);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [hasMetaMask, setHasMetaMask] = useState(false);
+  const [error, setError] = useState("");
+
+  const getNetworkName = (id) => {
+    switch (id) {
+      case "0x1":
+        return "Ethereum Mainnet";
+      case "0xaa36a7":
+        return "Sepolia Testnet";
+      case "0x5":
+        return "Goerli";
+      case "0x89":
+        return "Polygon";
+      case "0xa4b1":
+        return "Arbitrum";
+      case "0xa":
+        return "Optimism";
+      case "0x539":
+      case "0x7a69":
+        return "Localhost 8545";
+      default:
+        return id ? `Chain ${parseInt(id, 16) || id}` : "Unknown Network";
+    }
+  };
+
+  const updateBalance = useCallback(async (acc) => {
+    if (!window.ethereum || !acc) return;
+    try {
+      const balHex = await window.ethereum.request({
+        method: "eth_getBalance",
+        params: [acc, "latest"],
+      });
+      const wei = BigInt(balHex);
+      const eth = Number(wei / 1000000000000000n) / 1000;
+      setBalance(eth.toFixed(4));
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    if (typeof window !== "undefined" && window.ethereum) {
+      setHasMetaMask(true);
+
+      // Check if user has already granted permission
+      window.ethereum
+        .request({ method: "eth_accounts" })
+        .then(async (accounts) => {
+          if (accounts && accounts.length > 0) {
+            setAccount(accounts[0]);
+            const cId = await window.ethereum.request({ method: "eth_chainId" });
+            setChainId(cId);
+            setNetworkName(getNetworkName(cId));
+            updateBalance(accounts[0]);
+          }
+        })
+        .catch(() => {});
+
+      const handleAccountsChanged = (accounts) => {
+        if (!accounts || accounts.length === 0) {
+          setAccount(null);
+          setBalance(null);
+        } else {
+          setAccount(accounts[0]);
+          updateBalance(accounts[0]);
+        }
+      };
+
+      const handleChainChanged = (cId) => {
+        setChainId(cId);
+        setNetworkName(getNetworkName(cId));
+      };
+
+      window.ethereum.on("accountsChanged", handleAccountsChanged);
+      window.ethereum.on("chainChanged", handleChainChanged);
+
+      return () => {
+        if (window.ethereum?.removeListener) {
+          window.ethereum.removeListener("accountsChanged", handleAccountsChanged);
+          window.ethereum.removeListener("chainChanged", handleChainChanged);
+        }
+      };
+    }
+  }, [updateBalance]);
+
+  async function connect() {
+    if (typeof window === "undefined" || !window.ethereum) {
+      window.open("https://metamask.io/download/", "_blank");
+      throw new Error("MetaMask not detected. Please install the MetaMask browser extension.");
+    }
+
+    setIsConnecting(true);
+    setError("");
+
+    try {
+      const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+      if (accounts && accounts.length > 0) {
+        setAccount(accounts[0]);
+        const cId = await window.ethereum.request({ method: "eth_chainId" });
+        setChainId(cId);
+        setNetworkName(getNetworkName(cId));
+        await updateBalance(accounts[0]);
+        return accounts[0];
+      }
+    } catch (err) {
+      const msg = err.code === 4001 ? "MetaMask connection rejected by user." : err.message;
+      setError(msg);
+      throw new Error(msg);
+    } finally {
+      setIsConnecting(false);
+    }
+  }
+
+  function disconnect() {
+    setAccount(null);
+    setBalance(null);
+  }
+
+  /**
+   * Signs an EIP-191 cryptographic attestation of media authenticity
+   */
+  async function signAttestation({ fileName, fileHash, ipfsCid, companyId }) {
+    if (!account) {
+      throw new Error("MetaMask wallet is not connected");
+    }
+
+    const timestamp = new Date().toISOString();
+    const message = [
+      "AUTHENTICITY PROVENANCE ATTESTATION",
+      "----------------------------------------",
+      `Publisher  : ${companyId || "Verified Company"}`,
+      `File Name  : ${fileName}`,
+      `SHA-256    : ${fileHash}`,
+      `IPFS CID   : ${ipfsCid}`,
+      `Timestamp  : ${timestamp}`,
+      "----------------------------------------",
+      "I attest with my cryptographic private key that this media asset is authentic and registered on the decentralized ledger.",
+    ].join("\n");
+
+    const signature = await window.ethereum.request({
+      method: "personal_sign",
+      params: [message, account],
+    });
+
+    return { signature, message, signerAddress: account };
+  }
+
+  return {
+    account,
+    chainId,
+    networkName,
+    balance,
+    isConnecting,
+    hasMetaMask,
+    error,
+    connect,
+    disconnect,
+    signAttestation,
+  };
 }
 
 // ─── Sub-Components ───────────────────────────────────────────────────────────
@@ -183,41 +382,77 @@ function Scene({ reg, cur, className }) {
   );
 }
 
-/** Displays SHA-256 hash with copy button and verification flag */
-function HashDisplay({ hash, label = "SHA-256", serverHash, className = "" }) {
+/** Displays SHA-256 hash or IPFS CID with copy button and verification flag */
+function HashDisplay({ hash, label = "SHA-256", serverHash, ipfsCid, className = "" }) {
   const [copied, setCopied] = useState(false);
   if (!hash) return null;
 
   const mismatch = serverHash && serverHash !== hash;
 
-  async function copy() {
-    await navigator.clipboard.writeText(hash).catch(() => {});
+  async function copy(val) {
+    await navigator.clipboard.writeText(val || hash).catch(() => {});
     setCopied(true);
     setTimeout(() => setCopied(false), 1800);
   }
 
   return (
-    <div className={`space-y-1.5 ${className}`}>
-      <div className="flex items-center gap-2">
-        <span className={`${tagCls} bg-ink text-bg`}>{label}</span>
-        {serverHash && !mismatch && (
-          <span className={`${tagCls} bg-green-600 text-white`}>✓ server confirmed</span>
-        )}
-        {mismatch && (
-          <span className={`${tagCls} bg-red-600 text-white`}>⚠ hash mismatch</span>
-        )}
+    <div className={`space-y-2 ${className}`}>
+      {/* SHA-256 Fingerprint */}
+      <div className="space-y-1">
+        <div className="flex items-center gap-2">
+          <span className={`${tagCls} bg-ink text-bg`}>{label}</span>
+          {serverHash && !mismatch && (
+            <span className={`${tagCls} bg-green-600 text-white`}>✓ server confirmed</span>
+          )}
+          {mismatch && (
+            <span className={`${tagCls} bg-red-600 text-white`}>⚠ hash mismatch</span>
+          )}
+        </div>
+        <div className="flex items-start gap-3 bg-black/5 dark:bg-white/5 p-2.5 rounded-sm">
+          <p className="break-all font-mono text-xs text-mute flex-1 leading-relaxed">{hash}</p>
+          <button
+            type="button"
+            onClick={() => copy(hash)}
+            className="shrink-0 text-xs font-mono text-mute hover:text-ink underline transition-colors"
+            title="Copy hash"
+          >
+            {copied ? "copied" : "copy"}
+          </button>
+        </div>
       </div>
-      <div className="flex items-start gap-3 bg-black/5 dark:bg-white/5 p-2.5 rounded-sm">
-        <p className="break-all font-mono text-xs text-mute flex-1 leading-relaxed">{hash}</p>
-        <button
-          type="button"
-          onClick={copy}
-          className="shrink-0 text-xs font-mono text-mute hover:text-ink underline transition-colors"
-          title="Copy hash to clipboard"
-        >
-          {copied ? "copied" : "copy"}
-        </button>
-      </div>
+
+      {/* IPFS CID v0 Content Identifier */}
+      {ipfsCid && (
+        <div className="space-y-1 pt-1">
+          <div className="flex items-center gap-2">
+            <span className={`${tagCls} bg-cyan-700 text-white`}>IPFS CIDv0</span>
+            <span className="text-[0.65rem] font-mono text-mute">Decentralized Storage</span>
+          </div>
+          <div className="flex items-start gap-3 bg-cyan-950/10 border border-cyan-800/30 p-2.5 rounded-sm">
+            <p className="break-all font-mono text-xs text-cyan-800 dark:text-cyan-300 flex-1 leading-relaxed">
+              {ipfsCid}
+            </p>
+            <div className="flex items-center gap-2 shrink-0">
+              <a
+                href={`https://ipfs.io/ipfs/${ipfsCid}`}
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs font-mono text-cyan-600 dark:text-cyan-400 hover:underline"
+                title="View on public IPFS gateway"
+              >
+                gateway ↗
+              </a>
+              <button
+                type="button"
+                onClick={() => copy(ipfsCid)}
+                className="text-xs font-mono text-mute hover:text-ink underline"
+              >
+                copy
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -258,7 +493,7 @@ function DropZone({ file, onFile, hashing, label = "Choose file" }) {
       {hashing ? (
         <div className="flex flex-col items-center gap-2 text-mute py-2">
           <Spinner size={6} />
-          <p className="text-sm font-mono">Computing SHA-256 fingerprint…</p>
+          <p className="text-sm font-mono">Computing SHA-256 & IPFS CID…</p>
         </div>
       ) : file ? (
         <div className="space-y-1">
@@ -266,22 +501,144 @@ function DropZone({ file, onFile, hashing, label = "Choose file" }) {
           <p className="text-xs text-mute font-mono">
             {(file.size / 1024).toFixed(1)} KB · {file.type || "binary"}
           </p>
-          <p className="text-[0.7rem] text-mute pt-1">Click to replace file</p>
+          <p className="text-[0.7rem] text-mute pt-1">Click or drag to replace file</p>
         </div>
       ) : (
         <div className="space-y-2 text-mute">
           <p className="text-3xl leading-none">↑</p>
           <p className="text-sm font-medium">{label} or drag here</p>
-          <p className="text-[0.7rem]">Fingerprint calculated locally with SHA-256</p>
+          <p className="text-[0.7rem]">SHA-256 fingerprint & IPFS CID computed locally</p>
         </div>
       )}
     </div>
   );
 }
 
-// ─── COLUMN 1: REGISTER FILE (Company ID & Password) ──────────────────────────
+// ─── MetaMask Wallet Modal ───────────────────────────────────────────────────
 
-function RegisterColumn({ company, token, onLogin, onLogout }) {
+function WalletModal({ metaMask, onClose }) {
+  const [copied, setCopied] = useState(false);
+
+  function copyAddr() {
+    if (!metaMask.account) return;
+    navigator.clipboard.writeText(metaMask.account);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1800);
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4"
+      onClick={(e) => e.target === e.currentTarget && onClose()}
+    >
+      <div className="relative w-full max-w-sm border border-ink bg-bg p-6 lg:p-7 shadow-2xl">
+        <button
+          onClick={onClose}
+          className="absolute right-4 top-4 text-mute hover:text-ink text-xl leading-none"
+        >
+          ×
+        </button>
+
+        <div className="flex items-center gap-2.5 mb-2">
+          <span className="text-2xl">🦊</span>
+          <h3 className="text-base font-semibold">MetaMask Web3 Wallet</h3>
+        </div>
+
+        {metaMask.account ? (
+          <div className="space-y-4 pt-2">
+            <div className="bg-black/5 dark:bg-white/5 p-3 rounded space-y-1">
+              <p className="text-[0.65rem] uppercase tracking-widest text-mute font-mono">
+                Connected Address
+              </p>
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-mono text-xs font-semibold break-all">
+                  {metaMask.account}
+                </span>
+                <button
+                  onClick={copyAddr}
+                  className="text-xs font-mono text-mute hover:text-ink underline shrink-0"
+                >
+                  {copied ? "copied" : "copy"}
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 text-xs">
+              <div className="border border-rule p-2.5">
+                <p className="text-[0.65rem] text-mute uppercase font-mono">Network</p>
+                <p className="font-semibold mt-0.5">{metaMask.networkName}</p>
+              </div>
+              <div className="border border-rule p-2.5">
+                <p className="text-[0.65rem] text-mute uppercase font-mono">Balance</p>
+                <p className="font-semibold font-mono mt-0.5">
+                  {metaMask.balance != null ? `${metaMask.balance} ETH` : "—"}
+                </p>
+              </div>
+            </div>
+
+            <div className="border-t border-rule pt-4 flex gap-2">
+              <a
+                href={`https://etherscan.io/address/${metaMask.account}`}
+                target="_blank"
+                rel="noreferrer"
+                className={btnAlt + " flex-1 text-xs py-2"}
+              >
+                Etherscan ↗
+              </a>
+              <button
+                onClick={() => {
+                  metaMask.disconnect();
+                  onClose();
+                }}
+                className={btnAlt + " text-xs py-2 text-red-600 hover:text-red-700"}
+              >
+                Disconnect
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4 pt-2">
+            <p className="text-xs text-mute leading-relaxed">
+              Connect your MetaMask wallet to cryptographically sign digital media assets with your
+              Ethereum private key during blockchain registration.
+            </p>
+
+            <button
+              onClick={async () => {
+                try {
+                  await metaMask.connect();
+                  onClose();
+                } catch {}
+              }}
+              disabled={metaMask.isConnecting}
+              className={btn + " w-full text-xs py-2.5"}
+            >
+              {metaMask.isConnecting ? <><Spinner size={3} /> Requesting Accounts…</> : "🦊 Connect MetaMask"}
+            </button>
+
+            {!metaMask.hasMetaMask && (
+              <p className="text-[0.7rem] text-mute text-center">
+                Need MetaMask?{" "}
+                <a
+                  href="https://metamask.io/download/"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline hover:text-ink"
+                >
+                  Install extension ↗
+                </a>
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── COLUMN 1: REGISTER FILE (Company ID & Password + MetaMask) ───────────────
+
+function RegisterColumn({ company, token, onLogin, onLogout, metaMask }) {
   // Auth state within column
   const [authMode, setAuthMode] = useState("login"); // 'login' | 'new_company'
   const [companyId, setCompanyId] = useState("");
@@ -293,23 +650,33 @@ function RegisterColumn({ company, token, onLogin, onLogout }) {
   // File registration state
   const [file, setFile] = useState(null);
   const [clientHash, setClientHash] = useState("");
+  const [clientIpfsCid, setClientIpfsCid] = useState("");
   const [hashing, setHashing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [regResult, setRegResult] = useState(null);
   const [errorMsg, setErrorMsg] = useState("");
+
+  // Web3 MetaMask attestation toggle
+  const [signWithWallet, setSignWithWallet] = useState(true);
 
   const handleFile = useCallback(async (f) => {
     setFile(f);
     setRegResult(null);
     setErrorMsg("");
     setClientHash("");
+    setClientIpfsCid("");
     setHashing(true);
-    const h = await sha256File(f);
+
+    const [h, cid] = await Promise.all([
+      sha256File(f),
+      calculateClientIpfsCid(f),
+    ]);
+
     setClientHash(h);
+    setClientIpfsCid(cid);
     setHashing(false);
   }, []);
 
-  // Quick helper to fill demo credentials
   function fillDemo(id, pw) {
     setCompanyId(id);
     setPassword(pw);
@@ -317,7 +684,6 @@ function RegisterColumn({ company, token, onLogin, onLogout }) {
     setAuthMsg("");
   }
 
-  // Handle explicit sign in or registration of new company
   async function handleCompanyAuth(e) {
     e.preventDefault();
     setAuthLoading(true);
@@ -353,12 +719,10 @@ function RegisterColumn({ company, token, onLogin, onLogout }) {
     }
   }
 
-  // Handle Registering file on blockchain
   async function handleRegisterFile(e) {
     e.preventDefault();
     if (!file) return;
 
-    // Check if company credentials are ready
     if (!company && (!companyId.trim() || !password)) {
       setErrorMsg("Please enter your Company ID and Password to register files.");
       return;
@@ -368,16 +732,45 @@ function RegisterColumn({ company, token, onLogin, onLogout }) {
     setErrorMsg("");
     setAuthMsg("");
 
-    const form = new FormData();
-    form.append("file", file);
-
-    // If not authenticated via token, attach credentials directly to multipart body
-    if (!token) {
-      form.append("company_id", companyId.trim().toUpperCase());
-      form.append("password", password);
-    }
-
     try {
+      let walletSignature = null;
+      let attestationMessage = null;
+      let signerAddress = null;
+
+      // Optional MetaMask EIP-191 Cryptographic Signature
+      if (metaMask.account && signWithWallet) {
+        try {
+          const signResult = await metaMask.signAttestation({
+            fileName: file.name,
+            fileHash: clientHash,
+            ipfsCid: clientIpfsCid,
+            companyId: company?.company_id || companyId.trim().toUpperCase(),
+          });
+          walletSignature = signResult.signature;
+          attestationMessage = signResult.message;
+          signerAddress = signResult.signerAddress;
+        } catch (sigErr) {
+          setErrorMsg(`MetaMask signature cancelled: ${sigErr.message}`);
+          setSubmitting(false);
+          return;
+        }
+      }
+
+      const form = new FormData();
+
+      if (!token) {
+        form.append("company_id", companyId.trim().toUpperCase());
+        form.append("password", password);
+      }
+
+      if (signerAddress && walletSignature && attestationMessage) {
+        form.append("signer_wallet", signerAddress);
+        form.append("wallet_signature", walletSignature);
+        form.append("attestation_message", attestationMessage);
+      }
+
+      form.append("file", file);
+
       const headers = {};
       if (token) headers.Authorization = `Bearer ${token}`;
 
@@ -389,7 +782,6 @@ function RegisterColumn({ company, token, onLogin, onLogout }) {
 
       setRegResult(data);
 
-      // If registered with inline credentials and not yet logged in, auto-save company
       if (!company && data.registered_by) {
         onLogin({
           token: "",
@@ -415,12 +807,12 @@ function RegisterColumn({ company, token, onLogin, onLogout }) {
       <div>
         <div className="flex items-center justify-between mb-2">
           <span className={`${tagCls} bg-ink text-bg`}>Company Portal</span>
-          <span className="text-xs font-mono text-mute">Mint to Blockchain</span>
+          <span className="text-xs font-mono text-mute">Mint to Blockchain & IPFS</span>
         </div>
         <h2 className={h2cls}>Register Original File</h2>
         <p className="text-sm text-mute mb-6">
-          Reserved exclusively for verified companies. Enter company credentials to record the
-          SHA-256 fingerprint into the immutable ledger.
+          Authorized companies mint original media onto the blockchain. The file is pinned to IPFS,
+          fingerprinted with SHA-256, and optionally signed with MetaMask.
         </p>
 
         {/* Company Authentication State / Form */}
@@ -462,7 +854,7 @@ function RegisterColumn({ company, token, onLogin, onLogout }) {
 
             <div className="space-y-3">
               <div>
-                <label className="block text-[0.65rem] uppercase tracking-widest text-mute mb-1">
+                <label className="block text-[0.65rem] uppercase tracking-widest text-mute mb-1 font-mono">
                   Company ID
                 </label>
                 <input
@@ -476,7 +868,7 @@ function RegisterColumn({ company, token, onLogin, onLogout }) {
 
               {authMode === "new_company" && (
                 <div>
-                  <label className="block text-[0.65rem] uppercase tracking-widest text-mute mb-1">
+                  <label className="block text-[0.65rem] uppercase tracking-widest text-mute mb-1 font-mono">
                     Company Name
                   </label>
                   <input
@@ -489,7 +881,7 @@ function RegisterColumn({ company, token, onLogin, onLogout }) {
               )}
 
               <div>
-                <label className="block text-[0.65rem] uppercase tracking-widest text-mute mb-1">
+                <label className="block text-[0.65rem] uppercase tracking-widest text-mute mb-1 font-mono">
                   Password
                 </label>
                 <input
@@ -502,7 +894,6 @@ function RegisterColumn({ company, token, onLogin, onLogout }) {
                 />
               </div>
 
-              {/* Demo auto-fill helpers */}
               {authMode === "login" && (
                 <div className="pt-1 flex flex-wrap items-center gap-1.5 text-[0.7rem] text-mute">
                   <span>Demo IDs:</span>
@@ -541,16 +932,58 @@ function RegisterColumn({ company, token, onLogin, onLogout }) {
           </div>
         )}
 
+        {/* MetaMask Web3 Signature Integration Option */}
+        <div className="mb-4 border border-rule p-3 text-xs bg-black/[0.02] dark:bg-white/[0.02]">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="text-base">🦊</span>
+              <span className="font-semibold">MetaMask Wallet Signature</span>
+            </div>
+            {metaMask.account ? (
+              <span className="font-mono text-[0.7rem] text-green-600 dark:text-green-400">
+                ● {formatAddress(metaMask.account)}
+              </span>
+            ) : (
+              <button
+                type="button"
+                onClick={() => metaMask.connect().catch(() => {})}
+                className="text-xs font-mono underline hover:text-ink"
+              >
+                Connect Wallet
+              </button>
+            )}
+          </div>
+
+          {metaMask.account ? (
+            <label className="flex items-center gap-2 mt-2.5 cursor-pointer text-mute hover:text-ink">
+              <input
+                type="checkbox"
+                checked={signWithWallet}
+                onChange={(e) => setSignWithWallet(e.target.checked)}
+                className="accent-black dark:accent-white"
+              />
+              <span className="text-[0.75rem]">
+                Sign registration with {formatAddress(metaMask.account)} (EIP-191 Provenance Attestation)
+              </span>
+            </label>
+          ) : (
+            <p className="text-[0.7rem] text-mute mt-1.5 leading-relaxed">
+              Optional: Connect MetaMask to bind an Ethereum cryptographic signature to this file.
+            </p>
+          )}
+        </div>
+
         {/* File Dropzone */}
         <form onSubmit={handleRegisterFile} className="space-y-4">
           <DropZone file={file} onFile={handleFile} hashing={hashing} label="Choose original file" />
 
-          {/* Client SHA-256 fingerprint */}
+          {/* Client SHA-256 fingerprint & IPFS CID */}
           {clientHash && (
             <HashDisplay
               hash={clientHash}
-              label="SHA-256 (client)"
+              label="SHA-256 Fingerprint"
               serverHash={regResult?.file_hash}
+              ipfsCid={clientIpfsCid}
             />
           )}
 
@@ -570,7 +1003,7 @@ function RegisterColumn({ company, token, onLogin, onLogout }) {
           {regResult && (
             <div className="border border-green-600 bg-green-50 dark:bg-green-950/30 p-4 space-y-2.5 text-xs">
               <p className="font-semibold text-green-700 dark:text-green-400 text-sm">
-                ✓ Successfully Minted to Blockchain
+                ✓ Successfully Minted to Blockchain & IPFS
               </p>
               <div className="space-y-1 font-mono text-mute">
                 <p>
@@ -583,11 +1016,33 @@ function RegisterColumn({ company, token, onLogin, onLogout }) {
                 <p>
                   <span className="text-ink">Timestamp:</span> {regResult.block.timestamp}
                 </p>
-                <p>
-                  <span className="text-ink">PoW Nonce:</span> {regResult.block.nonce}
-                </p>
+                {regResult.ipfs_cid && (
+                  <p className="break-all">
+                    <span className="text-ink font-semibold">IPFS CID:</span>{" "}
+                    <a
+                      href={`https://ipfs.io/ipfs/${regResult.ipfs_cid}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-cyan-700 dark:text-cyan-400 underline"
+                    >
+                      {regResult.ipfs_cid} ↗
+                    </a>
+                  </p>
+                )}
+                {regResult.signer_wallet && (
+                  <p className="break-all">
+                    <span className="text-ink font-semibold">Web3 Signer:</span>{" "}
+                    <span className="text-purple-700 dark:text-purple-300">
+                      {regResult.signer_wallet}
+                    </span>{" "}
+                    <span className="text-[0.65rem] text-green-600 font-sans">(EIP-191 Verified)</span>
+                  </p>
+                )}
                 <p className="break-all">
                   <span className="text-ink">Block Hash:</span> {regResult.block.block_hash}
+                </p>
+                <p>
+                  <span className="text-ink">PoW Nonce:</span> {regResult.block.nonce}
                 </p>
               </div>
             </div>
@@ -600,10 +1055,13 @@ function RegisterColumn({ company, token, onLogin, onLogout }) {
           >
             {submitting ? (
               <>
-                <Spinner /> Mining Block (PoW)…
+                <Spinner />{" "}
+                {metaMask.account && signWithWallet
+                  ? "Signing in MetaMask & Mining Block…"
+                  : "Mining Block (PoW)…"}
               </>
             ) : (
-              "Register File on Blockchain (SHA-256)"
+              "Register File on Blockchain (SHA-256 & IPFS)"
             )}
           </button>
         </form>
@@ -618,6 +1076,7 @@ function VerifyColumn() {
   const [file, setFile] = useState(null);
   const [uploader, setUploader] = useState("");
   const [clientHash, setClientHash] = useState("");
+  const [clientIpfsCid, setClientIpfsCid] = useState("");
   const [hashing, setHashing] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [verResult, setVerResult] = useState(null);
@@ -628,9 +1087,16 @@ function VerifyColumn() {
     setVerResult(null);
     setErrorMsg("");
     setClientHash("");
+    setClientIpfsCid("");
     setHashing(true);
-    const h = await sha256File(f);
+
+    const [h, cid] = await Promise.all([
+      sha256File(f),
+      calculateClientIpfsCid(f),
+    ]);
+
     setClientHash(h);
+    setClientIpfsCid(cid);
     setHashing(false);
   }, []);
 
@@ -670,13 +1136,13 @@ function VerifyColumn() {
         <h2 className={h2cls}>Upload & Verify File</h2>
         <p className="text-sm text-mute mb-6">
           Open to everyone. No login or password required. Upload any copy to test whether its
-          SHA-256 matches an original registered on the chain.
+          SHA-256 and IPFS CID match an authentic original registered on the chain.
         </p>
 
         <form onSubmit={handleVerify} className="space-y-4">
           <div>
-            <label className="block text-[0.65rem] uppercase tracking-widest text-mute mb-1">
-              Your Name or Reference <span className="normal-case">(optional)</span>
+            <label className="block text-[0.65rem] uppercase tracking-widest text-mute mb-1 font-mono">
+              Auditor Name or Email <span className="normal-case">(optional)</span>
             </label>
             <input
               className={inputCls}
@@ -688,12 +1154,13 @@ function VerifyColumn() {
 
           <DropZone file={file} onFile={handleFile} hashing={hashing} label="Choose copy to verify" />
 
-          {/* Client SHA-256 fingerprint */}
+          {/* Client SHA-256 fingerprint & IPFS CID */}
           {clientHash && (
             <HashDisplay
               hash={clientHash}
-              label="SHA-256 (client)"
+              label="SHA-256 Fingerprint"
               serverHash={serverHash}
+              ipfsCid={clientIpfsCid}
             />
           )}
 
@@ -718,7 +1185,7 @@ function VerifyColumn() {
                 <div className="flex items-center gap-2 text-base font-semibold">
                   <span>
                     {verResult.verdict === "AUTHENTIC"
-                      ? "✓ Authentic & Registered"
+                      ? "✓ Authentic & Registered on Chain"
                       : verResult.verdict === "SUSPICIOUS"
                       ? "⚠ Registered — AI Flags Manipulation"
                       : "✗ Not Registered on Blockchain"}
@@ -726,10 +1193,71 @@ function VerifyColumn() {
                 </div>
                 <p className="text-xs opacity-90 mt-1">
                   {verResult.is_registered
-                    ? `Matching block record found in block #${verResult.block?.block_index} by ${verResult.block?.company_id}.`
-                    : "This fingerprint does not match any registered block. The media may be unverified or modified."}
+                    ? `Matching record confirmed in block #${verResult.block?.block_index} by ${verResult.block?.company_id}.`
+                    : "This fingerprint does not match any registered block. The media is unverified or has been modified."}
                 </p>
               </div>
+
+              {/* IPFS Decentralized Content Verification */}
+              {verResult.is_registered && verResult.block?.ipfs_cid && (
+                <div className="border border-cyan-800/30 bg-cyan-950/10 p-3.5 text-xs font-mono space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold text-cyan-800 dark:text-cyan-300 font-sans">
+                      IPFS Decentralized Storage
+                    </span>
+                    <span className={`${tagCls} bg-cyan-700 text-white`}>Verified Pin</span>
+                  </div>
+                  <p className="text-mute break-all">
+                    CID: <span className="text-ink">{verResult.block.ipfs_cid}</span>
+                  </p>
+                  <div className="flex items-center gap-3 pt-1">
+                    <a
+                      href={`/api/ipfs/${verResult.block.ipfs_cid}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline text-cyan-700 dark:text-cyan-400 hover:text-cyan-800"
+                    >
+                      Local IPFS Node ↗
+                    </a>
+                    <a
+                      href={`https://ipfs.io/ipfs/${verResult.block.ipfs_cid}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline text-cyan-700 dark:text-cyan-400 hover:text-cyan-800"
+                    >
+                      Public IPFS Gateway ↗
+                    </a>
+                  </div>
+                </div>
+              )}
+
+              {/* MetaMask Web3 Signature Verification Card */}
+              {verResult.is_registered && verResult.block?.signer_wallet && (
+                <div className="border border-purple-800/30 bg-purple-950/10 p-3.5 text-xs font-mono space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold text-purple-800 dark:text-purple-300 font-sans flex items-center gap-1.5">
+                      <span>🦊</span> MetaMask Web3 Signature
+                    </span>
+                    <span className={`${tagCls} bg-purple-700 text-white`}>EIP-191 Verified</span>
+                  </div>
+                  <p className="text-mute break-all">
+                    Signer: <span className="text-ink font-semibold">{verResult.block.signer_wallet}</span>
+                  </p>
+                  {verResult.block.wallet_signature && (
+                    <p className="text-mute truncate text-[0.7rem]">
+                      Sig: {verResult.block.wallet_signature.slice(0, 32)}...
+                    </p>
+                  )}
+                  <a
+                    href={`https://etherscan.io/address/${verResult.block.signer_wallet}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-block text-[0.75rem] underline text-purple-700 dark:text-purple-400 pt-0.5"
+                  >
+                    View Signer on Etherscan ↗
+                  </a>
+                </div>
+              )}
 
               {/* SHA-256 Match Confirmation */}
               <div className="bg-black/5 dark:bg-white/5 p-3 text-xs font-mono space-y-1.5">
@@ -777,7 +1305,7 @@ function VerifyColumn() {
                     />
                   </div>
                   <p className="text-[0.65rem] text-mute">
-                    Advisory statistical probability; does not supersede cryptographic blockchain proof.
+                    Advisory statistical probability; does not supersede cryptographic blockchain & IPFS proof.
                   </p>
                 </div>
               )}
@@ -791,10 +1319,10 @@ function VerifyColumn() {
           >
             {verifying ? (
               <>
-                <Spinner /> Querying Chain…
+                <Spinner /> Verifying Against Chain & IPFS…
               </>
             ) : (
-              "Verify File (SHA-256)"
+              "Verify File (SHA-256 & IPFS)"
             )}
           </button>
         </form>
@@ -842,10 +1370,10 @@ function ChainExplorer() {
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
           <h2 id="chain-h" className={h2cls}>
-            Blockchain Explorer
+            Blockchain & IPFS Explorer
           </h2>
           <p className="text-sm text-mute">
-            Live public ledger of registered media fingerprints and proof-of-work hashes.
+            Live public ledger of registered media fingerprints, IPFS content identifiers, and Web3 signatures.
           </p>
         </div>
         <button onClick={toggle} className={btnAlt + " text-sm py-2 px-4"}>
@@ -876,9 +1404,9 @@ function ChainExplorer() {
             </div>
           )}
 
-          <div className="grid gap-3 md:grid-cols-2">
+          <div className="grid gap-4 md:grid-cols-2">
             {blocks.map((b) => (
-              <div key={b.block_index} className="border border-rule p-4 text-xs space-y-1.5 font-mono">
+              <div key={b.block_index} className="border border-rule p-4 text-xs space-y-2 font-mono">
                 <div className="flex items-baseline justify-between gap-3 font-sans">
                   <span className="font-semibold text-sm">
                     Block #{b.block_index}
@@ -892,21 +1420,43 @@ function ChainExplorer() {
                 {b.file_name !== "GENESIS" && (
                   <>
                     <p className="text-mute truncate">
-                      File: <span className="text-ink">{b.file_name}</span>
+                      File: <span className="text-ink font-semibold">{b.file_name}</span>
                     </p>
                     <p className="text-mute">
                       Company: <span className="text-ink font-semibold">{b.company_id}</span>
                     </p>
                     <p className="break-all text-mute">
-                      File SHA-256: <span className="text-ink">{b.file_hash}</span>
+                      SHA-256: <span className="text-ink">{b.file_hash}</span>
                     </p>
+                    {b.ipfs_cid && (
+                      <p className="break-all text-mute">
+                        IPFS CID:{" "}
+                        <a
+                          href={`https://ipfs.io/ipfs/${b.ipfs_cid}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-cyan-700 dark:text-cyan-400 underline font-semibold"
+                        >
+                          {b.ipfs_cid} ↗
+                        </a>
+                      </p>
+                    )}
+                    {b.signer_wallet && (
+                      <p className="break-all text-mute">
+                        Signer:{" "}
+                        <span className="text-purple-700 dark:text-purple-300 font-semibold">
+                          {formatAddress(b.signer_wallet)}
+                        </span>{" "}
+                        <span className="text-[0.65rem] text-green-600 font-sans">✓ Web3 Verified</span>
+                      </p>
+                    )}
                   </>
                 )}
 
-                <p className="break-all text-mute">
+                <p className="break-all text-mute text-[0.7rem]">
                   Block Hash: <span className="text-ink">{b.block_hash}</span>
                 </p>
-                {b.nonce > 0 && <p className="text-mute">PoW Nonce: {b.nonce}</p>}
+                {b.nonce > 0 && <p className="text-mute text-[0.7rem]">PoW Nonce: {b.nonce}</p>}
               </div>
             ))}
           </div>
@@ -1064,13 +1614,16 @@ export default function App() {
       return null;
     }
   });
-  const [backendStatus, setBackendStatus] = useState("checking"); // 'checking' | 'online' | 'offline'
+  const [backendStatus, setBackendStatus] = useState("checking");
   const [customUrl, setCustomUrl] = useState(() => activeApiBase);
   const [showConfigModal, setShowConfigModal] = useState(false);
+  const [showWalletModal, setShowWalletModal] = useState(false);
   const [configTesting, setConfigTesting] = useState(false);
   const [configError, setConfigError] = useState("");
 
-  // Probe backend on mount
+  // Web3 MetaMask Hook
+  const metaMask = useMetaMask();
+
   useEffect(() => {
     checkConnection();
   }, []);
@@ -1191,6 +1744,11 @@ export default function App() {
         </div>
       )}
 
+      {/* MetaMask Wallet Modal */}
+      {showWalletModal && (
+        <WalletModal metaMask={metaMask} onClose={() => setShowWalletModal(false)} />
+      )}
+
       {/* Backend Connection Alert Banner */}
       {backendStatus === "offline" && (
         <div className="mt-4 border border-red-500 bg-red-50 dark:bg-red-950/30 p-4 text-xs text-red-800 dark:text-red-300">
@@ -1231,25 +1789,48 @@ export default function App() {
 
       {/* Navigation Header */}
       <header className="flex flex-wrap justify-between items-center gap-4 py-7 font-medium border-b border-rule">
-        <a href="#top" className="text-lg font-semibold tracking-tight hover:opacity-80">
-          Media Verification <span className="font-mono text-xs text-mute font-normal">/ SHA-256</span>
+        <a href="#top" className="text-lg font-semibold tracking-tight hover:opacity-80 flex items-center gap-2">
+          <span>Media Verification</span>
+          <span className="font-mono text-xs text-mute font-normal">/ SHA-256 · IPFS · Web3</span>
         </a>
-        <nav className="flex flex-wrap items-center gap-5 text-sm">
-          <a href="#demo" className="hover:underline hover:underline-offset-4">
-            Interactive Demo
+
+        <nav className="flex flex-wrap items-center gap-4 text-sm">
+          <a href="#demo" className="hover:underline hover:underline-offset-4 text-xs font-medium">
+            Demo
           </a>
-          <a href="#portal" className="hover:underline hover:underline-offset-4">
-            Verification Portal
+          <a href="#portal" className="hover:underline hover:underline-offset-4 text-xs font-medium">
+            Portal
           </a>
-          <a href="#how" className="hover:underline hover:underline-offset-4">
+          <a href="#how" className="hover:underline hover:underline-offset-4 text-xs font-medium">
             Architecture
           </a>
+
+          {/* MetaMask Web3 Wallet Header Button */}
+          {metaMask.account ? (
+            <button
+              onClick={() => setShowWalletModal(true)}
+              className="inline-flex items-center gap-1.5 border border-purple-600/40 bg-purple-50 dark:bg-purple-950/30 px-2.5 py-1 text-xs font-mono text-purple-800 dark:text-purple-300 rounded hover:border-purple-600 transition-colors"
+              title="Click to view connected MetaMask account"
+            >
+              <span>🦊</span>
+              <span>{formatAddress(metaMask.account)}</span>
+              <span className="text-[0.65rem] opacity-75">({metaMask.networkName})</span>
+            </button>
+          ) : (
+            <button
+              onClick={() => metaMask.connect().catch(() => setShowWalletModal(true))}
+              className="inline-flex items-center gap-1.5 border border-ink bg-transparent hover:bg-ink hover:text-bg px-2.5 py-1 text-xs font-mono font-medium rounded transition-colors"
+            >
+              <span>🦊</span>
+              <span>{metaMask.isConnecting ? "Connecting…" : "Connect Wallet"}</span>
+            </button>
+          )}
 
           {/* Connection Status Pill */}
           <button
             onClick={() => setShowConfigModal(true)}
             title="Click to view or change backend API URL"
-            className="inline-flex items-center gap-1.5 text-xs font-mono border border-rule px-2.5 py-1 rounded hover:border-ink transition-colors"
+            className="inline-flex items-center gap-1.5 text-xs font-mono border border-rule px-2 py-1 rounded hover:border-ink transition-colors"
           >
             <span
               className={`inline-block h-2 w-2 rounded-full ${
@@ -1264,8 +1845,8 @@ export default function App() {
           </button>
 
           {company && (
-            <div className="flex items-center gap-3">
-              <span className="text-xs font-mono bg-black/5 dark:bg-white/5 px-2.5 py-1">
+            <div className="flex items-center gap-2 border-l border-rule pl-3">
+              <span className="text-xs font-mono bg-black/5 dark:bg-white/5 px-2 py-0.5">
                 {company.company_id}
               </span>
               <button onClick={handleLogout} className="text-xs text-mute hover:text-ink underline">
@@ -1280,12 +1861,17 @@ export default function App() {
         {/* Hero Section */}
         <div className="grid items-center gap-8 lg:grid-cols-[1.2fr_1fr] pt-6">
           <div>
-            <h1 className="mb-6 mt-[clamp(2rem,5vw,4.5rem)] text-[clamp(2.5rem,6.5vw,5.5rem)] font-medium leading-[0.96] tracking-[-0.04em]">
-              Prove a file hasn't changed.
+            <div className="flex items-center gap-2 mb-3">
+              <span className={`${tagCls} bg-ink text-bg`}>Blockchain</span>
+              <span className={`${tagCls} bg-cyan-700 text-white`}>IPFS Storage</span>
+              <span className={`${tagCls} bg-purple-700 text-white`}>MetaMask EIP-191</span>
+            </div>
+            <h1 className="mb-6 text-[clamp(2.5rem,6.5vw,5.5rem)] font-medium leading-[0.96] tracking-[-0.04em]">
+              Prove media hasn't been forged.
             </h1>
             <p className="mb-8 max-w-[34em] text-[clamp(1.1rem,2vw,1.4rem)] leading-[1.4] text-mute">
-              Register original media with SHA-256 on an immutable blockchain ledger. Anyone can
-              verify any copy anywhere in seconds.
+              Pin authentic media to IPFS. Seal SHA-256 fingerprints and MetaMask cryptographic
+              attestations onto an immutable proof-of-work blockchain.
             </p>
             <div className="flex flex-wrap gap-3">
               <a className={btn} href="#portal">
@@ -1307,21 +1893,23 @@ export default function App() {
           <div className="mb-8">
             <span className={`${tagCls} bg-rule text-ink mb-2`}>Dual-Channel Access</span>
             <h2 className="text-[clamp(1.8rem,3.5vw,2.5rem)] font-medium tracking-tight">
-              Blockchain Media Portal
+              Blockchain & IPFS Media Portal
             </h2>
             <p className="text-mute max-w-[42em] text-sm">
-              Companies mint original file fingerprints using verified credentials. Everyone else
-              can upload and verify any copy freely against the distributed ledger.
+              Companies mint authentic media into IPFS and the blockchain ledger with optional
+              MetaMask Web3 signatures. Everyone else can audit any copy freely against the
+              decentralized network.
             </p>
           </div>
 
           <div className="grid lg:grid-cols-2 gap-8 items-stretch">
-            {/* Column 1: Company Only with ID and Password */}
+            {/* Column 1: Company Only with ID, Password & MetaMask */}
             <RegisterColumn
               company={company}
               token={token}
               onLogin={handleLogin}
               onLogout={handleLogout}
+              metaMask={metaMask}
             />
 
             {/* Column 2: Everyone Else (Public Upload) */}
@@ -1331,20 +1919,20 @@ export default function App() {
 
         {/* How It Works Architecture */}
         <section id="how" className={sec}>
-          <h2 className={h2cls}>How It Works</h2>
+          <h2 className={h2cls}>Decentralized Architecture</h2>
           <div className="grid gap-8 md:grid-cols-3">
             {[
               [
-                "1. SHA-256 Fingerprint",
-                "Every file has a unique 256-bit hash. Any edit, compression artifact, or manipulated pixel alters the hash completely.",
+                "1. SHA-256 & IPFS CID",
+                "Files are content-addressed into IPFS with standard CIDv0 multihashes (Qm...) and cryptographically fingerprinted with SHA-256 in the browser before upload.",
               ],
               [
-                "2. Company Minting",
-                "Authorized companies authenticate with their credentials to write the file hash, timestamp, and metadata into a proof-of-work blockchain block.",
+                "2. MetaMask Signature & PoW",
+                "Authorized publishers sign the media attestation with their MetaMask Ethereum wallet (EIP-191). The proof-of-work engine seals the block permanently.",
               ],
               [
-                "3. Public Verification & AI",
-                "Anyone can submit a file. The system checks the blockchain ledger and provides an advisory AI deepfake score without revealing original media.",
+                "3. Public Audit & Advisory AI",
+                "Anyone can submit any file copy to verify whether its IPFS CID, SHA-256 hash, and publisher signature match the decentralized chain, alongside an advisory AI deepfake score.",
               ],
             ].map(([title, desc]) => (
               <div key={title} className="border-t border-rule pt-4">
@@ -1361,8 +1949,8 @@ export default function App() {
 
       {/* Footer */}
       <footer className="mt-[clamp(5rem,14vw,8rem)] border-t border-ink pt-6 flex flex-wrap justify-between items-center gap-4 text-xs text-mute">
-        <p>Blockchain-Based Anti-Deepfake Authentication & Digital Media Verification System</p>
-        <p className="font-mono">Engine: SHA-256 · Consensus: Proof-of-Work</p>
+        <p>Blockchain-Based Anti-Deepfake Authentication & Decentralized Media Verification System</p>
+        <p className="font-mono">IPFS CIDv0 · MetaMask Web3 (EIP-191) · SHA-256 · Proof-of-Work</p>
       </footer>
     </div>
   );

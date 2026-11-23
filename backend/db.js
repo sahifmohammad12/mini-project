@@ -4,7 +4,8 @@
  *
  * Tables:
  *   companies      — registered organisations (each has a company_id + password)
- *   blockchain     — immutable chain of blocks; each block records one registered file
+ *   blockchain     — immutable chain of blocks; each block records one registered file,
+ *                     its SHA-256 fingerprint, IPFS CID, and optional MetaMask Web3 signature
  *   uploads        — public uploads awaiting verification (anyone can submit)
  *   verifications  — verification results tied to an upload
  */
@@ -38,15 +39,19 @@ db.exec(`
   );
 
   CREATE TABLE IF NOT EXISTS blockchain (
-    block_index   INTEGER PRIMARY KEY AUTOINCREMENT,
-    previous_hash TEXT    NOT NULL,
-    timestamp     TEXT    NOT NULL DEFAULT (datetime('now')),
-    file_hash     TEXT    NOT NULL UNIQUE,
-    file_name     TEXT    NOT NULL,
-    file_size     INTEGER NOT NULL,
-    company_id    TEXT    NOT NULL,
-    block_hash    TEXT    NOT NULL,
-    nonce         INTEGER NOT NULL DEFAULT 0
+    block_index         INTEGER PRIMARY KEY AUTOINCREMENT,
+    previous_hash       TEXT    NOT NULL,
+    timestamp           TEXT    NOT NULL DEFAULT (datetime('now')),
+    file_hash           TEXT    NOT NULL UNIQUE,
+    file_name           TEXT    NOT NULL,
+    file_size           INTEGER NOT NULL,
+    company_id          TEXT    NOT NULL,
+    block_hash          TEXT    NOT NULL,
+    nonce               INTEGER NOT NULL DEFAULT 0,
+    ipfs_cid            TEXT,
+    signer_wallet       TEXT,
+    wallet_signature    TEXT,
+    attestation_message TEXT
   );
 
   CREATE TABLE IF NOT EXISTS uploads (
@@ -59,18 +64,29 @@ db.exec(`
   );
 
   CREATE TABLE IF NOT EXISTS verifications (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    upload_id         INTEGER NOT NULL,
-    file_hash         TEXT    NOT NULL,
-    is_registered     INTEGER NOT NULL,
-    block_index       INTEGER,
-    registered_by     TEXT,
-    registered_at     TEXT,
-    ai_deepfake_score REAL,
-    verdict           TEXT    NOT NULL,
-    verified_at       TEXT    NOT NULL DEFAULT (datetime('now'))
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    upload_id           INTEGER NOT NULL,
+    file_hash           TEXT    NOT NULL,
+    is_registered       INTEGER NOT NULL,
+    block_index         INTEGER,
+    registered_by       TEXT,
+    registered_at       TEXT,
+    ai_deepfake_score   REAL,
+    verdict             TEXT    NOT NULL,
+    verified_at         TEXT    NOT NULL DEFAULT (datetime('now')),
+    ipfs_cid            TEXT,
+    signer_wallet       TEXT
   );
 `);
+
+// ─── Safe Migrations for Existing Tables ──────────────────────────────────────
+
+try { db.exec("ALTER TABLE blockchain ADD COLUMN ipfs_cid TEXT;"); } catch {}
+try { db.exec("ALTER TABLE blockchain ADD COLUMN signer_wallet TEXT;"); } catch {}
+try { db.exec("ALTER TABLE blockchain ADD COLUMN wallet_signature TEXT;"); } catch {}
+try { db.exec("ALTER TABLE blockchain ADD COLUMN attestation_message TEXT;"); } catch {}
+try { db.exec("ALTER TABLE verifications ADD COLUMN ipfs_cid TEXT;"); } catch {}
+try { db.exec("ALTER TABLE verifications ADD COLUMN signer_wallet TEXT;"); } catch {}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -78,8 +94,8 @@ function hashPassword(plain) {
   return crypto.createHash("sha256").update(plain + "DEEPFAKE_SALT_2024").digest("hex");
 }
 
-function computeBlockHash(index, previous_hash, file_hash, file_name, file_size, company_id, nonce) {
-  const data = `${index}${previous_hash}${file_hash}${file_name}${file_size}${company_id}${nonce}`;
+function computeBlockHash(index, previous_hash, file_hash, file_name, file_size, company_id, nonce, ipfs_cid = "", signer_wallet = "") {
+  const data = `${index}${previous_hash}${file_hash}${file_name}${file_size}${company_id}${nonce}${ipfs_cid || ""}${signer_wallet || ""}`;
   return crypto.createHash("sha256").update(data).digest("hex");
 }
 
@@ -89,17 +105,18 @@ const genesisRow = db.prepare("SELECT block_index FROM blockchain WHERE block_in
 if (!genesisRow) {
   const prevHash = "0".repeat(64);
   const fileHash = "0".repeat(64);
+  const ipfsCid  = "QmGenesisBlockZeroContentIdentifier0000000000";
   let nonce = 0;
   let blockHash;
   do {
     nonce++;
-    blockHash = computeBlockHash(1, prevHash, fileHash, "GENESIS", 0, "SYSTEM", nonce);
+    blockHash = computeBlockHash(1, prevHash, fileHash, "GENESIS", 0, "SYSTEM", nonce, ipfsCid, "");
   } while (!blockHash.startsWith("00"));
 
   db.prepare(`
-    INSERT INTO blockchain (previous_hash, file_hash, file_name, file_size, company_id, block_hash, nonce)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(prevHash, fileHash, "GENESIS", 0, "SYSTEM", blockHash, nonce);
+    INSERT INTO blockchain (previous_hash, file_hash, file_name, file_size, company_id, block_hash, nonce, ipfs_cid, signer_wallet, wallet_signature, attestation_message)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(prevHash, fileHash, "GENESIS", 0, "SYSTEM", blockHash, nonce, ipfsCid, "0x0000000000000000000000000000000000000000", "0xGENESIS", "Genesis Block Initialized");
 }
 
 // ─── Seed companies ───────────────────────────────────────────────────────────
@@ -137,7 +154,7 @@ function createCompany({ company_id, name, password }) {
   return { success: true, company: { company_id, name } };
 }
 
-function registerFile({ file_hash, file_name, file_size, company_id }) {
+function registerFile({ file_hash, file_name, file_size, company_id, ipfs_cid = null, signer_wallet = null, wallet_signature = null, attestation_message = null }) {
   const existing = db.prepare("SELECT * FROM blockchain WHERE file_hash = ?").get(file_hash);
   if (existing) {
     return { success: false, error: "FILE_ALREADY_REGISTERED", block: existing };
@@ -152,13 +169,25 @@ function registerFile({ file_hash, file_name, file_size, company_id }) {
   let blockHash;
   do {
     nonce++;
-    blockHash = computeBlockHash(nextIndex, last.block_hash, file_hash, file_name, file_size, company_id, nonce);
+    blockHash = computeBlockHash(nextIndex, last.block_hash, file_hash, file_name, file_size, company_id, nonce, ipfs_cid || "", signer_wallet || "");
   } while (!blockHash.startsWith(prefix));
 
   const result = db.prepare(`
-    INSERT INTO blockchain (previous_hash, file_hash, file_name, file_size, company_id, block_hash, nonce)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(last.block_hash, file_hash, file_name, file_size, company_id, blockHash, nonce);
+    INSERT INTO blockchain (previous_hash, file_hash, file_name, file_size, company_id, block_hash, nonce, ipfs_cid, signer_wallet, wallet_signature, attestation_message)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    last.block_hash,
+    file_hash,
+    file_name,
+    file_size,
+    company_id,
+    blockHash,
+    nonce,
+    ipfs_cid || null,
+    signer_wallet || null,
+    wallet_signature || null,
+    attestation_message || null
+  );
 
   return {
     success: true,
@@ -190,15 +219,17 @@ function verifyFile({ file_hash, file_name, file_size, uploader }) {
 
   db.prepare(`
     INSERT INTO verifications
-      (upload_id, file_hash, is_registered, block_index, registered_by, registered_at, ai_deepfake_score, verdict)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      (upload_id, file_hash, is_registered, block_index, registered_by, registered_at, ai_deepfake_score, verdict, ipfs_cid, signer_wallet)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     upload_id, file_hash, is_registered,
     block ? block.block_index : null,
     block ? block.company_id  : null,
     block ? block.timestamp   : null,
     parseFloat(ai_deepfake_score.toFixed(4)),
-    verdict
+    verdict,
+    block ? block.ipfs_cid    : null,
+    block ? block.signer_wallet : null
   );
 
   return {
@@ -225,7 +256,8 @@ function validateChain() {
     const prev = blocks[i - 1];
     const expected = computeBlockHash(
       b.block_index, b.previous_hash, b.file_hash,
-      b.file_name, b.file_size, b.company_id, b.nonce
+      b.file_name, b.file_size, b.company_id, b.nonce,
+      b.ipfs_cid || "", b.signer_wallet || ""
     );
     if (expected !== b.block_hash)       return { valid: false, bad_index: b.block_index, reason: "hash_mismatch" };
     if (b.previous_hash !== prev.block_hash) return { valid: false, bad_index: b.block_index, reason: "broken_link" };

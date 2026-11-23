@@ -20,8 +20,10 @@ const crypto   = require("crypto");
 const multer   = require("multer");
 const path     = require("path");
 const fs       = require("fs");
+const { ethers } = require("ethers");
 
-const db = require("./db");
+const db   = require("./db");
+const ipfs = require("./ipfs");
 
 const app  = express();
 const PORT = process.env.PORT || 4000;
@@ -161,22 +163,74 @@ app.post("/api/register", upload.single("file"), (req, res) => {
   const file_size = req.file.size;
   const company_id = company.company_id;
 
-  const result = db.registerFile({ file_hash, file_name, file_size, company_id });
+  // 3. Pin file to IPFS content-addressed storage
+  const ipfs_cid = ipfs.pinToIpfs(req.file.buffer);
+
+  // 4. Verify optional MetaMask Web3 wallet signature
+  let verifiedSigner = null;
+  const claimedWallet = req.body.signer_wallet || null;
+  const walletSig = req.body.wallet_signature || null;
+  const attestationMsg = req.body.attestation_message || null;
+
+  if (claimedWallet && walletSig && attestationMsg) {
+    try {
+      const recovered = ethers.verifyMessage(attestationMsg, walletSig);
+      if (recovered.toLowerCase() === claimedWallet.toLowerCase()) {
+        verifiedSigner = recovered;
+      }
+    } catch (err) {
+      console.warn("Wallet signature verification failed:", err.message);
+    }
+  }
+
+  const result = db.registerFile({
+    file_hash,
+    file_name,
+    file_size,
+    company_id,
+    ipfs_cid,
+    signer_wallet: verifiedSigner,
+    wallet_signature: walletSig,
+    attestation_message: attestationMsg,
+  });
 
   if (!result.success) {
     return res.status(409).json({
       error: "File already registered on the blockchain",
       details: result.block,
       file_hash,
+      ipfs_cid,
     });
   }
 
   res.status(201).json({
-    message: "File registered on the blockchain",
+    message: "File registered on the blockchain and pinned to IPFS",
     file_hash,
+    ipfs_cid,
+    signer_wallet: verifiedSigner,
+    ipfs_gateway: `/api/ipfs/${ipfs_cid}`,
+    public_ipfs_url: `https://ipfs.io/ipfs/${ipfs_cid}`,
     block: result.block,
     registered_by: company_id,
   });
+});
+
+// ── IPFS Gateway Endpoint ───────────────────────────────────────────────────
+
+/**
+ * GET /api/ipfs/:cid
+ * Serves content-addressed media directly from the decentralized IPFS node cache
+ */
+app.get("/api/ipfs/:cid", (req, res) => {
+  const cid = req.params.cid;
+  const buffer = ipfs.getFromIpfs(cid);
+  if (!buffer) {
+    return res.status(404).json({ error: `Content ${cid} not found on local IPFS gateway` });
+  }
+
+  res.setHeader("Content-Disposition", `inline; filename="${cid}"`);
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  res.send(buffer);
 });
 
 // ── Upload & Verify (anyone) ─────────────────────────────────────────────────
@@ -195,12 +249,18 @@ app.post("/api/upload", upload.single("file"), (req, res) => {
   const file_size = req.file.size;
   const uploader  = (req.body.uploader || "anonymous").toString().slice(0, 100);
 
+  // Compute IPFS CID of uploaded copy
+  const ipfs_cid = ipfs.calculateIpfsCid(req.file.buffer);
+
   const result = db.verifyFile({ file_hash, file_name, file_size, uploader });
 
   res.json({
     file_hash,
+    ipfs_cid,
     file_name,
     file_size,
+    ipfs_gateway: `/api/ipfs/${ipfs_cid}`,
+    public_ipfs_url: `https://ipfs.io/ipfs/${ipfs_cid}`,
     ...result,
   });
 });
